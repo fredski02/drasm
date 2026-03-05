@@ -107,6 +107,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "common"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "cpp_demangle"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -848,6 +855,7 @@ dependencies = [
 name = "producer"
 version = "0.1.0"
 dependencies = [
+ "common",
  "rdkafka",
  "serde",
  "serde_json",
@@ -1968,6 +1976,8 @@ dependencies = [
 name = "worker"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "common",
  "rdkafka",
  "serde",
  "serde_json",
