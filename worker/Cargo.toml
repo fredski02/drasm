@@ -12,3 +12,6 @@ serde_json.workspace = true
 wasmtime.workspace = true
 wat.workspace = true
 anyhow.workspace = true
+hostname = "0.4"
+uuid = { workspace = true }
+redis = { workspace = true }

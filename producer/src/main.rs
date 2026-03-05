@@ -1,19 +1,18 @@
-use common::Job;
+use common::{BROKERS, JOBS_TOPIC, Job};
 use rdkafka::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use std::time::Duration;
 use uuid::Uuid;
 
-const BROKERS: &str = "localhost:9092";
-const JOBS_TOPIC: &str = "wasm_jobs";
-
 #[tokio::main]
 async fn main() {
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", BROKERS)
-        .set("message.timeout.ms", "5000")
+        .set("message.timeout.ms", "10000") // 10 seconds
+        .set("acks", "all") // Wait for full acknowledgment
+        .set("enable.idempotence", "true") // Prevent duplicates
         .create()
-        .expect("producer");
+        .expect("Failed to create producer");
 
     // Simple WAT module: run(x) = x + 1
     let wat = r#"
@@ -27,7 +26,7 @@ async fn main() {
     "#;
 
     let job = Job {
-        job_id: Uuid::new_v4().to_string(),
+        job_id: Uuid::from_u128(1).to_string(),
         wat: wat.to_string(),
         input: 41,
     };
@@ -39,7 +38,7 @@ async fn main() {
             FutureRecord::to(JOBS_TOPIC)
                 .key(&job.job_id)
                 .payload(&payload),
-            Duration::from_secs(3),
+            Duration::from_secs(0), // Use config-level timeout
         )
         .await;
 
@@ -57,3 +56,4 @@ async fn main() {
         }
     }
 }
+

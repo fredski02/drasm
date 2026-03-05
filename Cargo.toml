@@ -12,3 +12,4 @@ uuid = { version = "1.21.0", features = ["v4"] }
 wasmtime = "42.0.1"
 wat = "1.245.1"
 anyhow = "1.0.102"
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
