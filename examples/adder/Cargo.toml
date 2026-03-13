@@ -1,0 +1,12 @@
+[package]
+name = "adder"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]   # Important for WASM
+
+[dependencies]
+worker-api = { path = "../../drasm-api" }
+serde_json.workspace = true
+serde.workspace = true

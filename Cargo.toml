@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["producer", "worker", "results", "common"]
+members = ["orchestrator", "worker", "common", "drasm-api"]
 
 
 [workspace.dependencies]
@@ -13,3 +13,5 @@ wasmtime = "42.0.1"
 wat = "1.245.1"
 anyhow = "1.0.102"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+hostname = "0.4.2"
+reqwest = { version = "0.13.2"}

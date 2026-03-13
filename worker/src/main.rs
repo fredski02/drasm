@@ -3,12 +3,13 @@ mod retry;
 use common::*;
 use rdkafka::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
-use rdkafka::message::Message;
+use rdkafka::message::Message as KafkaMessage;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use redis::AsyncCommands;
 use retry::RetryTracker;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use wasmtime::{Engine, Instance, Module, Store};
+use wasmtime::{Caller, Engine, FuncType, Linker, Module, Store, Val, ValType};
+use worker_api::{Message, WasmSlice};
 
 const GROUP_ID: &str = "wasm-workers";
 
@@ -20,23 +21,224 @@ fn get_worker_id() -> String {
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
 }
 
-fn run_wat(wat_src: &str, input: i32) -> anyhow::Result<i32> {
-    let wasm_bytes = wat::parse_str(wat_src)?;
-    let engine = Engine::default();
-    let module = Module::new(&engine, wasm_bytes)?;
-    let mut store = Store::new(&engine, ());
-    let instance = Instance::new(&mut store, &module, &[])?;
+async fn execute_module(
+    engine: &Engine,
+    linker: &Linker<()>,
+    module_id: &str,
+    message: Message,
+) -> anyhow::Result<Message> {
+    // Try multiple paths to find the WASM module
+    let path = format!(
+        "examples/target/wasm32-unknown-unknown/release/{}.wasm",
+        module_id
+    );
 
-    let run = instance.get_typed_func::<i32, i32>(&mut store, "run")?;
+    let module = Some(Module::from_file(engine, &path)?);
 
-    let out = run.call(&mut store, input)?;
-    Ok(out)
+    let module = module.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Could not find WASM module '{}'. Tried paths: {path:?}",
+            module_id,
+        )
+    })?;
+
+    // Create store and instantiate via linker
+    let mut store = Store::new(engine, ());
+    let instance = linker.instantiate_async(&mut store, &module).await?;
+
+    // Get exports
+    let memory = instance
+        .get_memory(&mut store, "memory")
+        .ok_or_else(|| anyhow::anyhow!("no memory export"))?;
+    let alloc = instance.get_typed_func::<i32, i32>(&mut store, "alloc")?;
+    let dealloc = instance.get_typed_func::<(i32, i32), ()>(&mut store, "dealloc")?;
+    let handle = instance.get_typed_func::<(i32, i32), i64>(&mut store, "handle")?;
+
+    // Serialize input message to JSON
+    let input = serde_json::to_vec(&message)?;
+    let input_len = input.len() as i32;
+
+    // Allocate memory in guest and write input
+    let ptr = alloc.call_async(&mut store, input_len).await?;
+    memory.write(&mut store, ptr as usize, &input)?;
+
+    // Call handle function
+    let packed = handle.call_async(&mut store, (ptr, input_len)).await?;
+    let slice = WasmSlice::unpack(packed);
+
+    // Read response from guest memory
+    let mut buf = vec![0u8; slice.len as usize];
+    memory.read(&mut store, slice.ptr as usize, &mut buf)?;
+
+    // Cleanup guest memory
+    dealloc
+        .call_async(&mut store, (slice.ptr, slice.len))
+        .await?;
+    dealloc.call_async(&mut store, (ptr, input_len)).await?;
+
+    // Parse response message
+    let response: Message = serde_json::from_slice(&buf)?;
+    Ok(response)
 }
 
 #[tokio::main]
 async fn main() {
     let worker_id = get_worker_id();
     println!("Worker starting with ID: {}", worker_id);
+
+    // Initialize Wasmtime engine
+    let engine = Engine::default();
+
+    // Create linker with host functions
+    let mut linker = Linker::new(&engine);
+
+    // Host function: log
+    linker
+        .func_wrap(
+            "env",
+            "log",
+            |mut caller: Caller<'_, ()>, ptr: i32, len: i32| {
+                let mem = caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .expect("guest has no memory export");
+
+                let mut buf = vec![0u8; len as usize];
+                mem.read(&mut caller, ptr as usize, &mut buf)
+                    .expect("memory.read failed");
+
+                println!("[guest log] {}", String::from_utf8_lossy(&buf));
+            },
+        )
+        .expect("Failed to define log host function");
+
+    // Host function: http_request (async)
+    linker
+        .func_new_async(
+            "env",
+            "http_request",
+            FuncType::new(&engine, [ValType::I32, ValType::I32], [ValType::I64]),
+            |mut caller, params, results| {
+                Box::new(async move {
+                    let ptr = params[0].i32().unwrap();
+                    let len = params[1].i32().unwrap();
+
+                    let mem = caller
+                        .get_export("memory")
+                        .and_then(|e| e.into_memory())
+                        .expect("no memory");
+
+                    // Read job JSON from guest
+                    let mut buf = vec![0u8; len as usize];
+                    mem.read(&mut caller, ptr as usize, &mut buf).expect("read");
+
+                    // Parse { url, method?, headers?, body? }
+                    let job: serde_json::Value = serde_json::from_slice(&buf).unwrap_or_default();
+                    let url = job
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("https://example.com");
+                    let method = job.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
+                    let headers = job.get("headers").cloned().unwrap_or(serde_json::json!({}));
+                    let body = job.get("body");
+
+                    // Do HTTP via reqwest
+                    let client = reqwest::Client::new();
+                    let mut req =
+                        client.request(method.parse().unwrap_or(reqwest::Method::GET), url);
+
+                    if let Some(hs) = headers.as_object() {
+                        for (k, v) in hs {
+                            if let Some(val) = v.as_str() {
+                                req = req.header(k, val);
+                            }
+                        }
+                    }
+                    if let Some(b) = body {
+                        if b.is_string() {
+                            req = req.body(b.as_str().unwrap().to_owned());
+                        } else {
+                            req = req.json(b);
+                        }
+                    }
+
+                    let resp = req.send().await;
+
+                    let resp_bytes = match resp {
+                        Ok(r) => {
+                            let status = r.status().as_u16();
+
+                            // Try to decide if it's JSON from headers
+                            let is_json_hdr = r
+                                .headers()
+                                .get(reqwest::header::CONTENT_TYPE)
+                                .and_then(|h| h.to_str().ok())
+                                .map(|ct| ct.to_ascii_lowercase().contains("application/json"))
+                                .unwrap_or(false);
+
+                            if is_json_hdr {
+                                // Return the JSON BODY *directly* so the guest can parse into its T
+                                match r.json::<serde_json::Value>().await {
+                                    Ok(v) => serde_json::to_vec(&v).unwrap(),
+                                    Err(e) => serde_json::to_vec(&serde_json::json!({
+                                        "_error": format!("bad json body: {e}"),
+                                        "status": status
+                                    }))
+                                    .unwrap(),
+                                }
+                            } else {
+                                // Not advertised as JSON -> read text, but still try to parse as JSON first
+                                let text = r.text().await.unwrap_or_default();
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                                    // Looks like JSON anyway: return body JSON directly
+                                    serde_json::to_vec(&v).unwrap()
+                                } else {
+                                    // Plain text fallback: keep wrapper
+                                    serde_json::to_vec(
+                                        &serde_json::json!({ "status": status, "body": text }),
+                                    )
+                                    .unwrap()
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // Network or request error
+                            serde_json::to_vec(&serde_json::json!({
+                                "_error": format!("host http error: {e}")
+                            }))
+                            .unwrap()
+                        }
+                    };
+
+                    // Ask guest to alloc a buffer for the response
+                    let alloc = caller
+                        .get_export("alloc")
+                        .and_then(|e| e.into_func())
+                        .expect("no alloc");
+                    let alloc = alloc.typed::<i32, i32>(&caller).expect("typed alloc");
+                    let out_ptr = alloc
+                        .call_async(&mut caller, resp_bytes.len() as i32)
+                        .await
+                        .expect("alloc call failed");
+
+                    // Write response into guest memory
+                    mem.write(&mut caller, out_ptr as usize, &resp_bytes)
+                        .expect("write");
+
+                    // Return packed (ptr,len)
+                    let packed = WasmSlice {
+                        ptr: out_ptr,
+                        len: resp_bytes.len() as i32,
+                    }
+                    .pack();
+                    results[0] = Val::I64(packed);
+                    Ok(())
+                })
+            },
+        )
+        .expect("Failed to define http_request host function");
+
+    println!("Wasmtime engine and linker initialized");
 
     // Connect to Redis for idempotency tracking
     println!("Connecting to Redis at {}...", REDIS_URL);
@@ -110,17 +312,19 @@ async fn main() {
             continue;
         }
 
-        // Process job
-        let result = run_wat(&job.wat, job.input);
+        // Execute module
+        let result = execute_module(&engine, &linker, &job.module_id, job.message.clone()).await;
 
         match result {
-            Ok(output) => {
-                // Success: publish result
+            Ok(response_msg) => {
+                // Success: serialize response Message and publish
+                let response_bytes = serde_json::to_vec(&response_msg).unwrap_or_default();
+
                 let result_msg = ResultMsg {
                     job_id: job.job_id.clone(),
                     worker_id: worker_id.clone(),
                     ok: true,
-                    output: Some(output),
+                    output: Some(response_bytes),
                     error: None,
                 };
 
@@ -144,15 +348,18 @@ async fn main() {
                 // Commit offset
                 let _ = jobs_consumer.commit_message(&msg, rdkafka::consumer::CommitMode::Async);
 
-                println!("Processed job {} -> {}", job.job_id, output);
+                println!(
+                    "Processed job {} with module {} -> {}",
+                    job.job_id, job.module_id, response_msg.type_name
+                );
             }
             Err(e) => {
                 // Failure: check retry count
                 let attempts = retry_tracker.increment(&job.job_id);
 
                 eprintln!(
-                    "Job {} failed (attempt {}/{}): {}",
-                    job.job_id, attempts, MAX_RETRIES, e
+                    "Job {} (module {}) failed (attempt {}/{}): {}",
+                    job.job_id, job.module_id, attempts, MAX_RETRIES, e
                 );
 
                 if attempts >= MAX_RETRIES {

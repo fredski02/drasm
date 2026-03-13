@@ -1,15 +1,14 @@
 # DRASM - Distributed WASM Execution System
 
-A distributed system for executing WebAssembly modules using Kafka as the message broker and Redis for idempotency tracking.
+A distributed system for executing WebAssembly modules using Kafka as the message broker and Redis for idempotency tracking. Workers execute WASM modules with a rich Message protocol and host functions for logging and HTTP requests.
 
 ## Components
 
-1. **Producer** - Submits WASM jobs (WAT format) to Kafka
-2. **Worker** - Consumes jobs, executes WASM via Wasmtime, publishes results
-3. **Results Consumer** - Monitors and displays job results in real-time
-4. **Redis** - Idempotency tracking (24-hour TTL)
-5. **Kafka** - Message broker for job queue and results
-6. **Kafka UI** - Web interface for monitoring topics (http://localhost:8080)
+1. **Orchestrator** - Submits WASM jobs to Kafka and monitors results
+2. **Worker** - Consumes jobs, executes WASM modules with host functions (log, HTTP), publishes results
+3. **Redis** - Idempotency tracking (24-hour TTL)
+4. **Kafka** - Message broker for job queue and results
+5. **Kafka UI** - Web interface for monitoring topics (http://localhost:8080)
 
 ## Topics
 
@@ -43,11 +42,17 @@ A distributed system for executing WebAssembly modules using Kafka as the messag
 - Manual offset commits after successful processing
 - Redis for fast, reliable deduplication
 
+### 🔌 Host Functions
+- **log** - Guest modules can log messages to worker console
+- **http_request** - Async HTTP calls from WASM (supports JSON APIs)
+- Message protocol for structured request/response
+
 ## Prerequisites
 
 - Docker & Docker Compose
 - Rust 1.70+
 - Cargo
+- wasm32-unknown-unknown target: `rustup target add wasm32-unknown-unknown`
 
 ## Quick Start
 
@@ -67,44 +72,40 @@ docker-compose ps
 ./scripts/create-topics.sh
 ```
 
-### 3. Build Project
+### 3. Build WASM Examples
 
 ```bash
-cargo build --release
+# Build the example modules (echo, adder)
+cargo build --release --target wasm32-unknown-unknown
 ```
 
-### 4. Run the System
+### 4. Build and Run
 
 **Terminal 1: Start Worker**
 ```bash
-./target/release/worker
+cargo run --release --bin worker
 ```
 
 Expected output:
 ```
 Worker starting with ID: <hostname>
+Wasmtime engine and linker initialized
 Connected to Redis successfully
 Worker running. Waiting for jobs...
 ```
 
-**Terminal 2: Start Results Consumer** (optional)
+**Terminal 2: Start Orchestrator** (submits job and monitors results)
 ```bash
-./target/release/results
+cargo run --release --bin orchestrator
 ```
 
 Expected output:
 ```
-Results consumer running (showing new results only)...
-```
-
-**Terminal 3: Submit Jobs**
-```bash
-./target/release/producer
-```
-
-Expected output:
-```
-Submitted job_id=<uuid> partition=X offset=Y
+Submitted job_id=<uuid> module=echo partition=X offset=Y
+Orchestrator listening for results...
+[guest log] echo: hello from orchestrator!
+[guest log] typed url from httpbin: ...
+✓ RESULT [worker=<hostname>] job_id=<uuid> type=Response payload={"data":"Echo: hello from orchestrator!"}
 ```
 
 ### 5. Monitor via Kafka UI
@@ -135,12 +136,11 @@ redis-cli FLUSHDB
 
 ## Potential Improvements
 
+- [ ] S3 module storage (upload WASM to S3, workers fetch and cache)
 - [ ] WASI support for filesystem/network access
-- [ ] Multiple function exports per module
-- [ ] Richer input/output types (strings, bytes, structs)
 - [ ] Resource limits (fuel metering, memory caps, timeouts)
 - [ ] Metrics and tracing (Prometheus, Jaeger)
-- [ ] REST API for job submission
+- [ ] REST API for job submission (orchestrator as web server)
 - [ ] WebSocket for real-time result streaming
-- [ ] Module caching to avoid recompilation
+- [ ] Module compilation caching
 - [ ] Multi-broker Kafka cluster (replication-factor=3)

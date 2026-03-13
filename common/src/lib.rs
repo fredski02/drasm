@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+// Re-export Message from drasm-api
+pub use worker_api::Message;
+
 // Kafka broker and topic constants
 pub const MAX_RETRIES: u32 = 3;
 pub const BROKERS: &str = "localhost:9094";
@@ -15,8 +18,8 @@ pub const REDIS_TTL_SECONDS: u64 = 86400; // 24 hours
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Job {
     pub job_id: String,
-    pub wat: String,
-    pub input: i32,
+    pub module_id: String,
+    pub message: Message,
 }
 
 // Result message with worker identification
@@ -25,7 +28,7 @@ pub struct ResultMsg {
     pub job_id: String,
     pub worker_id: String,
     pub ok: bool,
-    pub output: Option<i32>,
+    pub output: Option<Vec<u8>>,
     pub error: Option<String>,
 }
 
