@@ -1,0 +1,12 @@
+{
+  "linkedProjects": [
+    "Cargo.toml",
+    "examples/Cargo.toml"
+  ],
+  "check": {
+    "allTargets": true
+  },
+  "cargo": {
+    "allTargets": true
+  }
+}
