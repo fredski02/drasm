@@ -7,11 +7,13 @@ use rdkafka::message::Message as KafkaMessage;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use redis::AsyncCommands;
 use retry::RetryTracker;
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wasmtime::{Caller, Engine, FuncType, Linker, Module, Store, Val, ValType};
 use worker_api::{Message, WasmSlice};
 
 const GROUP_ID: &str = "wasm-workers";
+const MODULE_CACHE_DIR: &str = "/tmp/drasm-modules";
 
 // Get worker ID (hostname or UUID)
 fn get_worker_id() -> String {
@@ -21,26 +23,83 @@ fn get_worker_id() -> String {
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
 }
 
+/// Download WASM module from Supabase Storage if not cached
+async fn download_module(
+    module_id: &str,
+    supabase_url: &str,
+    service_role_key: &str,
+) -> anyhow::Result<String> {
+    // Check cache first
+    tokio::fs::create_dir_all(MODULE_CACHE_DIR).await?;
+    let cache_path = format!("{}/{}.wasm", MODULE_CACHE_DIR, module_id);
+    
+    if Path::new(&cache_path).exists() {
+        println!("Using cached module: {}", module_id);
+        return Ok(cache_path);
+    }
+
+    println!("Downloading module {} from Supabase Storage...", module_id);
+
+    // Query database to get storage_path for this module_id
+    let client = reqwest::Client::new();
+    let db_url = format!(
+        "{}/rest/v1/modules?id=eq.{}&select=storage_path",
+        supabase_url, module_id
+    );
+    
+    let response = client
+        .get(&db_url)
+        .header("apikey", service_role_key)
+        .header("Authorization", &format!("Bearer {}", service_role_key))
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("Module {} not found in database", module_id);
+    }
+
+    let modules: Vec<serde_json::Value> = response.json().await?;
+    let storage_path = modules
+        .first()
+        .and_then(|m| m.get("storage_path"))
+        .and_then(|p| p.as_str())
+        .ok_or_else(|| anyhow::anyhow!("No storage_path for module {}", module_id))?;
+
+    // Download from Supabase Storage
+    let storage_url = format!("{}/storage/v1/object/wasm-modules/{}", supabase_url, storage_path);
+    
+    let wasm_response = client
+        .get(&storage_url)
+        .header("apikey", service_role_key)
+        .header("Authorization", &format!("Bearer {}", service_role_key))
+        .send()
+        .await?;
+
+    if !wasm_response.status().is_success() {
+        anyhow::bail!("Failed to download module from storage: {}", wasm_response.status());
+    }
+
+    let wasm_bytes = wasm_response.bytes().await?;
+    
+    // Save to cache
+    tokio::fs::write(&cache_path, &wasm_bytes).await?;
+    
+    println!("Downloaded and cached module: {}", module_id);
+    Ok(cache_path)
+}
+
 async fn execute_module(
     engine: &Engine,
     linker: &Linker<()>,
     module_id: &str,
     message: Message,
+    supabase_url: &str,
+    service_role_key: &str,
 ) -> anyhow::Result<Message> {
-    // Try multiple paths to find the WASM module
-    let path = format!(
-        "examples/target/wasm32-unknown-unknown/release/{}.wasm",
-        module_id
-    );
+    // Download module from Supabase Storage (or use cached version)
+    let path = download_module(module_id, supabase_url, service_role_key).await?;
 
-    let module = Some(Module::from_file(engine, &path)?);
-
-    let module = module.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Could not find WASM module '{}'. Tried paths: {path:?}",
-            module_id,
-        )
-    })?;
+    let module = Module::from_file(engine, &path)?;
 
     // Create store and instantiate via linker
     let mut store = Store::new(engine, ());
@@ -83,6 +142,14 @@ async fn execute_module(
 
 #[tokio::main]
 async fn main() {
+    // Load environment variables
+    dotenvy::dotenv().ok();
+    
+    let supabase_url = std::env::var("SUPABASE_URL")
+        .expect("SUPABASE_URL must be set");
+    let service_role_key = std::env::var("SUPABASE_SERVICE_ROLE_KEY")
+        .expect("SUPABASE_SERVICE_ROLE_KEY must be set");
+    
     let worker_id = get_worker_id();
     println!("Worker starting with ID: {}", worker_id);
 
@@ -313,7 +380,15 @@ async fn main() {
         }
 
         // Execute module
-        let result = execute_module(&engine, &linker, &job.module_id, job.message.clone()).await;
+        let result = execute_module(
+            &engine,
+            &linker,
+            &job.module_id,
+            job.message.clone(),
+            &supabase_url,
+            &service_role_key,
+        )
+        .await;
 
         match result {
             Ok(response_msg) => {

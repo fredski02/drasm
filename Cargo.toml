@@ -5,7 +5,7 @@ members = ["orchestrator", "worker", "common", "drasm-api"]
 
 [workspace.dependencies]
 rdkafka = { version = "0.39.0", features = ["tokio"] }
-tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread", "fs"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 uuid = { version = "1.21.0", features = ["v4"] }

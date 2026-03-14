@@ -17,3 +17,4 @@ uuid = { workspace = true }
 redis = { workspace = true }
 worker-api = { path = "../drasm-api" }
 reqwest = { workspace = true, features = ["json"] }
+dotenvy = "0.15"
